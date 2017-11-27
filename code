@@ -1,0 +1,291 @@
+import json
+import numpy as np
+from tqdm import tqdm
+import torch
+import torch.nn as nn
+import torch_util
+from torch.autograd import Variable
+from torch import optim
+import torch.nn.functional as F
+import copy
+
+### Load data
+
+def obtain_data(file_name='snli_1.0/small_0.05_snli_train.jsonl', vocab_file_name='vocabu.txt'):
+    json_data = []
+    
+    with open(file_name) as data_file:
+        for l in data_file:
+            json_data.append(json.loads(l))
+    
+    data = []
+    for item in json_data:
+
+        if item['gold_label'] == '-':
+            continue
+        s1 = item['sentence1']
+        s2 = item['sentence2']
+        label = item['gold_label']
+        example = (s1, s2, label)
+        data.append(example)
+    
+    stoi = []
+    with open(vocab_file_name) as voc_file:
+        stoi = voc_file.read().split('\n')[:-1]
+        stoi = [item for item in stoi]
+    return data, stoi
+    
+    
+    label_id = {'entailment': 0, 'neutral': 1, 'contradiction': 2}
+
+
+# build dictionary
+#stoi is a python list which can be used to map a unique id into a word.
+#itos is a python dictionary which can be used to map a given word into the corresponding id.
+#embeddings is a numpy array with shape: (size_of_vocabulary, embedding_dimension). 
+#Note: The ith row of your embeddings will be the vector for the word whose id is i.
+# Using glove embedding as embedding layer
+
+class Vocabulary(object):
+    def __init__(self, stoi):
+        self.embeddings = None
+        self.itos = dict()
+        self.stoi = stoi
+    
+    def set_word_embedding(self, embedding_file='glove.6B/glove.6B.300d.txt'):
+        glove_stoi = []
+        glove_vector = []
+        with open(embedding_file) as data_file:
+            for i,line in enumerate(data_file):
+                splitLine = line.split()
+                word = splitLine[0]
+                embedding = np.array([float(val) for val in splitLine[1:]])
+                glove_stoi.append(word)
+                glove_vector.append(embedding)
+                
+        vocab_size = len(self.stoi)
+        embed_d = 300
+        self.embeddings = []
+        glove_itos = {k: i for i,k in enumerate(glove_stoi)}
+        for word in self.stoi:
+            if word not in glove_stoi:
+                self.embeddings.append(np.random.randn(embed_d))
+            else:
+                self.embeddings.append(glove_vector[glove_itos[word]])
+        self.embeddings = np.asarray(self.embeddings, dtype = np.float32)
+    
+    def dummy_embedding(self, embed_d=300):
+        for i, w in enumerate(self.stoi):
+            self.itos[w] = i
+        vocab_size = len(self.stoi)
+        self.embeddings = np.asarray(np.random.randn(vocab_size, embed_d), dtype=np.float32)
+        
+    def process_data(self, data):
+        numerialized_data = []
+        self.itos = {k: i for i,k in enumerate(self.stoi)}
+        conv = lambda x: self.itos[x] if x in self.stoi else self.itos[self.stoi[-1]]
+        for s1, s2, y in data:
+            n_s1 = [conv(item) for item in s1.split(' ')]
+            n_s2 = [conv(item) for item in s2.split(' ')]
+            n_y = label_id[y]
+            numerialized_data.append((n_s1, n_s2, n_y))
+            
+        return numerialized_data
+        
+  def batch_index_gen(batch_size, size):
+    batch_indexer = []
+    start = 0
+    while start < size:
+        end = start + batch_size
+        if end > size:
+            end = size
+        batch_indexer.append((start, end))
+        start = end
+    return batch_indexer
+
+def convert_to_numpy(data, padding_length=50):
+    total_size = len(data)
+    dataN = []
+    for i, s1 in enumerate(data):
+        l1 = len(s1)
+        #l2 = len(s2)
+        if l1 >= 50:
+            sl1 = s1[:50]
+        else: 
+            sl1 = list(s1)
+            sl1.extend([0]*(padding_length-l1))
+        '''if l2 >= 50:
+            sl2 = data[i][1][:50]
+        else:
+            sl2 = list(data[i][1])
+            sl2.extend([0]*(padding_length-l2))'''
+        dataN.append(sl1)
+    return dataN
+        
+
+def pack_for_rnn_seq(inputs, lengths, batch_first=True):
+    """
+    :param inputs: Shape of the input should be [B, T, D] if batch_first else [T, B, D].
+    :param lengths:  [B]
+    :param batch_first: 
+    :return: 
+    """
+    if not batch_first:
+        _, sorted_indices = lengths.sort()
+        '''
+            Reverse to decreasing order
+        '''
+        r_index = reversed(list(sorted_indices))
+
+        s_inputs_list = []
+        lengths_list = []
+        reverse_indices = np.zeros(lengths.size(0), dtype=np.int64)
+
+        for j, i in enumerate(r_index):
+            s_inputs_list.append(inputs[:, i, :].unsqueeze(1))
+            lengths_list.append(lengths[i])
+            reverse_indices[i] = j
+
+        reverse_indices = list(reverse_indices)
+
+        s_inputs = torch.cat(s_inputs_list, 1)
+        packed_seq = nn.utils.rnn.pack_padded_sequence(s_inputs, lengths_list)
+
+        return packed_seq, reverse_indices
+
+    else:
+        #_, sorted_indices = lengths.sort()
+        
+        sorted_indices = sorted(range(len(lengths)),key=lambda x:lengths[x])
+        
+        '''
+            Reverse to decreasing order
+        '''
+        r_index = reversed(list(sorted_indices))
+        s_inputs_list = []
+        lengths_list = []
+        reverse_indices = np.zeros(len(lengths), dtype=np.int64)
+        for j, i in enumerate(r_index):
+   
+            s_inputs_list.append(inputs[i, :, :])
+            lengths_list.append(lengths[i])
+            reverse_indices[i] = j
+
+        reverse_indices = list(reverse_indices)
+        s_inputs = torch.stack(s_inputs_list, dim=0)
+  
+        packed_seq = nn.utils.rnn.pack_padded_sequence(s_inputs, lengths_list, batch_first=batch_first)
+        return packed_seq, reverse_indices
+    
+def unpack_from_rnn_seq(packed_seq, reverse_indices, batch_first=True):
+    unpacked_seq, _ = nn.utils.rnn.pad_packed_sequence(packed_seq, batch_first=batch_first)
+    s_inputs_list = []
+    if not batch_first:
+        for i in reverse_indices:
+            s_inputs_list.append(unpacked_seq[:, i, :].unsqueeze(1))
+        return torch.cat(s_inputs_list, 1)
+    else:
+        for i in reverse_indices:
+            s_inputs_list.append(unpacked_seq[i, :, :].unsqueeze(0))
+        
+        return torch.cat(s_inputs_list, 0)
+
+# model
+class YourModel(nn.Module):
+    
+    def __init__(self, h_size=128, v_size=10, d=300, mlp_d=256):
+        super(YourModel, self).__init__()
+        self.embedding = nn.Embedding(v_size, d)
+        self.LSTM = nn.LSTM(d, h_size)
+        self.mlp_l = nn.Linear(h_size*2,mlp_d)
+        self.sm = nn.Linear(mlp_d, 3)
+        self.softmax = nn.Softmax()
+        
+    def display(self):
+        for param in self.parameters():
+            print(param.data.size())
+
+    def forward(self, x, y, lenx, leny):
+        x = self.embedding(x)
+        packed_seq_x, reverse_indices_x = pack_for_rnn_seq(x, lenx, batch_first=True)
+        packed_seq_x2, _ = self.LSTM(packed_seq_x)
+        x = unpack_from_rnn_seq(packed_seq_x2, reverse_indices_x, batch_first=True)
+        xn = []
+        for i,k in enumerate(lenx):
+            xn.append(x[i,k-1,:])
+        x = torch.stack(xn, dim=0)
+        
+        y = self.embedding(y)
+        packed_seq_y, reverse_indices_y = pack_for_rnn_seq(y, leny, batch_first=True)
+        packed_seq_y, _ = self.LSTM(packed_seq_y)
+        y = unpack_from_rnn_seq(packed_seq_y, reverse_indices_y, batch_first=True)
+        yn = []
+        for i,k in enumerate(leny):
+            yn.append(y[i,k-1,:])
+        y = torch.stack(yn, dim=0)
+        
+        xy = torch.cat((x,y),1)
+        xy_linear = F.sigmoid(self.mlp_l(xy))
+        xy_sm = F.sigmoid(self.sm(xy_linear))
+        output = self.softmax(xy_sm)
+
+        return output
+        
+model = YourModel()
+model.embedding.weight.data = torch.from_numpy(vocab.embeddings)
+model.display()
+
+import torch.autograd as autograd
+import torch.optim as optim
+
+batch_size = 16
+h_size=128
+mlp_d=256
+
+loss_function = nn.CrossEntropyLoss()
+losses = []
+
+model = YourModel(h_size=h_size, v_size=10, d=300, mlp_d=mlp_d)
+model.embedding.weight.data = torch.from_numpy(vocab.embeddings)
+optimizer = optim.Adam(model.parameters(), lr=0.003)
+size = len(n_data)
+
+def get_batch_data(batch_data,pad_len=50):
+    lenx = []
+    leny = []
+    s1 = []
+    s2 = []
+    label = []
+    for data in batch_data:
+        lenx.append(min(len(data[0]),pad_len))
+        leny.append(min(len(data[1]),pad_len))
+        s1.append(data[0])
+        s2.append(data[1])
+        label.append(data[2])
+    return (s1,lenx,s2,leny,label)
+
+for epoch in range(10):
+    total_loss = torch.Tensor([0])
+    for i,(start, end) in enumerate(batch_index_gen(batch_size, size)):
+        if i % 1000 == 0:
+            print(total_loss)
+        model.zero_grad()
+        
+        batch_data = n_data[start:end]
+        s1, lenx, s2, leny, label = get_batch_data(batch_data)
+        pad_s1 = torch.LongTensor(convert_to_numpy(s1))
+        pad_s2 = torch.LongTensor(convert_to_numpy(s2))
+        
+        label = torch.LongTensor(label)
+        
+        log_probs = model(autograd.Variable(pad_s1), autograd.Variable(pad_s2), lenx, leny)
+
+    
+        loss = loss_function(log_probs, autograd.Variable(label))
+
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.data
+    losses.append(total_loss)
+print(losses)  # The loss decreased every iteration over the training data!
